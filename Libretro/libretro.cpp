@@ -20,6 +20,9 @@
 #include "../Core/SoundMixer.h"
 #include "../Utilities/FolderUtilities.h"
 #include "../Utilities/HexUtilities.h"
+#ifdef HAVE_ORE
+#include <smelt.h>
+#endif
 
 #define DEVICE_AUTO               RETRO_DEVICE_JOYPAD
 #define DEVICE_GAMEPAD            RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_JOYPAD, 0)
@@ -100,6 +103,45 @@ extern "C" {
 			logCallback(level, message);
 		}
 	}
+
+#ifdef HAVE_ORE
+	// Read an ORE, oxyromon's disc format, through libsmelt as the ROM it holds.
+	// The reader refuses a file whose magic it does not know, so this answers
+	// false for a plain .nes handed to the core under the .ore extension.
+	static bool LoadOreRom(const string &path, VirtualFile &out)
+	{
+		struct smelt_ingot *ingot = nullptr;
+		uint64_t size = 0;
+		if(smelt_open(path.c_str(), nullptr, &ingot) != SMELT_OK ||
+			smelt_logical_size(ingot, &size) != SMELT_OK) {
+			logMessage(RETRO_LOG_ERROR, ("ORE " + path + ": " + smelt_last_error() + "\n").c_str());
+			smelt_close(ingot);
+			return false;
+		}
+
+		// A NES ROM or an FDS disk, so anything past a megabyte is the wrong
+		// format in the wrong core, not a rom to load
+		if(size == 0 || size > (1u << 20)) {
+			std::stringstream message;
+			message << "ORE " << path << " holds " << size << " bytes, which no NES or FDS mapper can read\n";
+			logMessage(RETRO_LOG_ERROR, message.str().c_str());
+			smelt_close(ingot);
+			return false;
+		}
+
+		std::vector<uint8_t> rom(size);
+		bool read = (smelt_read(ingot, 0, rom.data(), (size_t)size) == SMELT_OK);
+		smelt_close(ingot);
+		if(!read) {
+			logMessage(RETRO_LOG_ERROR, ("ORE " + path + ": " + smelt_last_error() + "\n").c_str());
+			return false;
+		}
+
+		// Keep the .ore name: the game database and HdPacks are found through it
+		out = VirtualFile(rom.data(), rom.size(), path);
+		return true;
+	}
+#endif
 
 	RETRO_API unsigned retro_api_version()
 	{
@@ -1112,7 +1154,32 @@ extern "C" {
 		}
 
 		// Load content
-		VirtualFile romData(gameData, gameSize, gamePath);
+		VirtualFile romData;
+#ifdef HAVE_ORE
+		// RetroArch unzips what it knows; an ORE reaches the core as itself,
+		// on disk, which is what libsmelt reads. gameExt->data holds the .ore
+		// file's own bytes, not the ROM's, so the smelted bytes replace them
+		bool isOre = false;
+#ifdef _WIN32
+		const char oreExt[] = ".ore";
+		isOre = gamePath.size() >= 4 &&
+			_stricmp(gamePath.substr(gamePath.size() - 4).c_str(), oreExt) == 0;
+#else
+		isOre = gamePath.size() >= 4 &&
+			strcasecmp(gamePath.c_str() + gamePath.size() - 4, ".ore") == 0;
+#endif
+		if(isOre) {
+			VirtualFile oreRom;
+			if(!LoadOreRom(gamePath, oreRom)) {
+				return false;
+			}
+			romData = oreRom;
+		} else {
+			romData = VirtualFile(gameData, gameSize, gamePath);
+		}
+#else
+		romData = VirtualFile(gameData, gameSize, gamePath);
+#endif
 		bool result = _console->Initialize(romData);
 
 		if(result) {
@@ -1164,7 +1231,11 @@ extern "C" {
 		// need_fullpath is required since HdPacks are
 		// identified via the rom file name
 		info->need_fullpath = true;
+#ifdef HAVE_ORE
+		info->valid_extensions = "nes|fds|unf|unif|ore";
+#else
 		info->valid_extensions = "nes|fds|unf|unif";
+#endif
 		info->block_extract = false;
 	}
 
